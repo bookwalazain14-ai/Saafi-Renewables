@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Molecular Gas Atmosphere — Petroleum & Oil Edition</title>
+    <!-- Tailwind CSS for minimalist controls -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Three.js Core + Post-Processing for Depth-of-Field Bokeh Blur -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/EffectComposer.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/RenderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/ShaderPass.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/CopyShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/shaders/BokehShader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/postprocessing/BokehPass.js"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            /* Crisp, deep obsidian-mahogany backdrop so golden & ruby specular highlights pop */
+            background: radial-gradient(circle at 50% 45%, #1d0c04 0%, #0d0502 58%, #040100 100%);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            user-select: none;
+        }
+        #canvas-container {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Three.js WebGL Canvas Container -->
+    <div id="canvas-container"></div>
+
+    <script>
+        // --- SCENE, CAMERA, & TRANSPARENT RENDERER SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+
+        // Subtle, deep mahogany distance falloff without muddy sepia haze
+        scene.fog = new THREE.FogExp2(0x090301, 0.018);
+
+        const camera = new THREE.PerspectiveCamera(52, window.innerWidth / window.innerHeight, 0.1, 200);
+        // Camera positioned at z = 16; central molecules sit at z = 0 (focal distance = 16.0)
+        camera.position.set(0, 0, 16);
+
+        const renderer = new THREE.WebGLRenderer({
+            antialias: true,
+            alpha: true,
+            powerPreference: 'high-performance'
+        });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.35;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        container.appendChild(renderer.domElement);
+
+        // --- PROCEDURAL HIGH-CONTRAST STUDIO ENVIRONMENT MAP FOR WET OIL SHEEN ---
+        // Generates crisp golden, amber, and ruby specular reflection bands on clear-coated spheres
+        function createOilReflectionEnvMap() {
+            const pmremGenerator = new THREE.PMREMGenerator(renderer);
+            pmremGenerator.compileEquirectangularShader();
+
+            const envScene = new THREE.Scene();
+            envScene.background = new THREE.Color(0x070201);
+
+            // Overhead warm white-gold studio softbox strip for razor-sharp wet glints
+            const topStrip = new THREE.Mesh(
+                new THREE.PlaneGeometry(28, 5),
+                new THREE.MeshBasicMaterial({ color: new THREE.Color(4.5, 3.6, 1.9), side: THREE.DoubleSide })
+            );
+            topStrip.position.set(0, 14, 6);
+            topStrip.rotation.x = Math.PI / 2.4;
+            envScene.add(topStrip);
+
+            // Left luminous liquid-gold reflector
+            const leftGold = new THREE.Mesh(
+                new THREE.PlaneGeometry(14, 18),
+                new THREE.MeshBasicMaterial({ color: new THREE.Color(3.2, 1.7, 0.25), side: THREE.DoubleSide })
+            );
+            leftGold.position.set(-16, 2, 4);
+            leftGold.rotation.y = Math.PI / 2.2;
+            envScene.add(leftGold);
+
+            // Right fiery copper-crimson rim reflector
+            const rightRuby = new THREE.Mesh(
+                new THREE.PlaneGeometry(14, 18),
+                new THREE.MeshBasicMaterial({ color: new THREE.Color(3.0, 0.55, 0.15), side: THREE.DoubleSide })
+            );
+            rightRuby.position.set(16, -2, 2);
+            rightRuby.rotation.y = -Math.PI / 2.2;
+            envScene.add(rightRuby);
+
+            // Bottom amber bounce strip
+            const bottomBounce = new THREE.Mesh(
+                new THREE.PlaneGeometry(24, 10),
+                new THREE.MeshBasicMaterial({ color: new THREE.Color(1.4, 0.65, 0.1), side: THREE.DoubleSide })
+            );
+            bottomBounce.position.set(0, -14, 2);
+            bottomBounce.rotation.x = -Math.PI / 2;
+            envScene.add(bottomBounce);
+
+            const envRT = pmremGenerator.fromScene(envScene, 0.02);
+            pmremGenerator.dispose();
+            return envRT.texture;
+        }
+
+        const oilEnvMap = createOilReflectionEnvMap();
+        scene.environment = oilEnvMap;
+
+        // --- DEPTH-OF-FIELD POST-PROCESSING (BOKEH PASS) ---
+        // Keeps z = 0 (Ethane & Isobutylene) razor sharp while blurring background CH4 & CO2 molecules
+        let composer = null;
+        let bokehPass = null;
+        let usePostProcessing = true;
+
+        try {
+            composer = new THREE.EffectComposer(renderer);
+            const renderPass = new THREE.RenderPass(scene, camera);
+            renderPass.clearAlpha = 0; // Preserve CSS radial gradient background
+            composer.addPass(renderPass);
+
+            bokehPass = new THREE.BokehPass(scene, camera, {
+                focus: 16.0,       // Exact distance from camera (z=16) to focal plane (z=0)
+                aperture: 0.00024, // Smooth optical bokeh blur for out-of-focus background gas
+                maxblur: 0.0075,   // Crisp foreground edges with creamy background bokeh
+                width: window.innerWidth,
+                height: window.innerHeight
+            });
+            composer.addPass(bokehPass);
+        } catch (err) {
+            console.warn('Bokeh post-processing unavailable, falling back to standard renderer:', err);
+            usePostProcessing = false;
+        }
+
+        // --- CRISP HIGH-CONTRAST STUDIO LIGHTING FOR SPECULAR OIL GLINTS ---
+        const ambientLight = new THREE.AmbientLight(0x260d03, 0.85);
+        scene.add(ambientLight);
+
+        // Bright warm white-gold key light for sharp wet highlights
+        const keyLight = new THREE.DirectionalLight(0xfff1c2, 3.6);
+        keyLight.position.set(8, 15, 14);
+        scene.add(keyLight);
+
+        // Vibrant reddish-orange rim light to sculpt the dark viscous edges
+        const warmRedRim = new THREE.DirectionalLight(0xff3b0a, 3.2);
+        warmRedRim.position.set(-14, -6, -4);
+        scene.add(warmRedRim);
+
+        // Crisp golden side-rim light for metallic-oil edge sheen
+        const goldRimLight = new THREE.DirectionalLight(0xffb703, 2.6);
+        goldRimLight.position.set(14, -9, -2);
+        scene.add(goldRimLight);
+
+        // Concentrated golden core light between Ethane and Isobutylene
+        const coreGlowLight = new THREE.PointLight(0xffaa00, 3.5, 22);
+        coreGlowLight.position.set(0, 0.5, 5);
+        scene.add(coreGlowLight);
+
+        // --- HIGH-GLOSS VISCOUS OIL & LIQUID-METAL MATERIALS ---
+        // Carbon: Deep glossy crude-oil obsidian with wet clearcoat & golden-bronze reflections
+        const carbonMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0x140903,
+            emissive: 0x1a0701,
+            emissiveIntensity: 0.25,
+            roughness: 0.07,
+            metalness: 0.88,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.04,
+            reflectivity: 1.0,
+            envMap: oilEnvMap,
+            envMapIntensity: 1.85
+        });
+
+        // Hydrogen: Luminous liquid-gold / polished champagne-amber droplets
+        const hydrogenMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xffcf40,
+            emissive: 0x4a1d02,
+            emissiveIntensity: 0.22,
+            roughness: 0.09,
+            metalness: 0.72,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.05,
+            reflectivity: 1.0,
+            envMap: oilEnvMap,
+            envMapIntensity: 1.75
+        });
+
+        // Oxygen (for CO2): Glossy translucent-look ruby-garnet / fiery red-amber resin
+        const oxygenMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xe62e00,
+            emissive: 0x520900,
+            emissiveIntensity: 0.32,
+            roughness: 0.08,
+            metalness: 0.65,
+            clearcoat: 1.0,
+            clearcoatRoughness: 0.04,
+            reflectivity: 1.0,
+            envMap: oilEnvMap,
+            envMapIntensity: 1.8
+        });
+
+        // Chemical Bonds: Sleek liquid-copper / burnished gold struts
+        const bondMaterial = new THREE.MeshPhysicalMaterial({
+            color: 0xf59e0b,
+            emissive: 0x3b1202,
+            emissiveIntensity: 0.2,
+            roughness: 0.14,
+            metalness: 0.92,
+            clearcoat: 0.9,
+            clearcoatRoughness: 0.08,
+            envMap: oilEnvMap,
+            envMapIntensity: 1.6
+        });
+
+        // Shared geometries for high performance
+        const carbonGeom = new THREE.SphereGeometry(0.54, 40, 40);
+        const hydrogenGeom = new THREE.SphereGeometry(0.31, 32, 32);
+        const oxygenGeom = new THREE.SphereGeometry(0.48, 32, 32);
+
+        // Helper functions to build atoms and cylindrical chemical bonds
+        function createAtom(type) {
+            if (type === 'C') return new THREE.Mesh(carbonGeom, carbonMaterial);
+            if (type === 'H') return new THREE.Mesh(hydrogenGeom, hydrogenMaterial);
+            if (type === 'O') return new THREE.Mesh(oxygenGeom, oxygenMaterial);
+            return new THREE.Mesh(carbonGeom, carbonMaterial);
+        }
+
+        function createBond(p1, p2, radius = 0.12) {
+            const direction = new THREE.Vector3().subVectors(p2, p1);
+            const length = direction.length();
+            const geometry = new THREE.CylinderGeometry(radius, radius, length, 16);
+            const bond = new THREE.Mesh(geometry, bondMaterial);
+            bond.position.addVectors(p1, p2).multiplyScalar(0.5);
+            bond.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.normalize());
+            return bond;
+        }
+
+        // --- CENTRAL FOREGROUND MOLECULES (SHARP FOCUS AT Z = 0) ---
+        const coreGroup = new THREE.Group();
+        scene.add(coreGroup);
+
+        // 1. ETHANE (C2H6) — Staggered Conformation
+        const ethaneGroup = new THREE.Group();
+        const c1Pos = new THREE.Vector3(-0.76, 0, 0);
+        const c2Pos = new THREE.Vector3(0.76, 0, 0);
+
+        const c1 = createAtom('C'); c1.position.copy(c1Pos); ethaneGroup.add(c1);
+        const c2 = createAtom('C'); c2.position.copy(c2Pos); ethaneGroup.add(c2);
+        ethaneGroup.add(createBond(c1Pos, c2Pos, 0.15));
+
+        const hC1Positions = [
+            new THREE.Vector3(-1.16, 0.94, 0),
+            new THREE.Vector3(-1.16, -0.47, 0.81),
+            new THREE.Vector3(-1.16, -0.47, -0.81)
+        ];
+        hC1Positions.forEach(p => {
+            const h = createAtom('H'); h.position.copy(p); ethaneGroup.add(h);
+            ethaneGroup.add(createBond(c1Pos, p));
+        });
+
+        const hC2Positions = [
+            new THREE.Vector3(1.16, -0.94, 0),
+            new THREE.Vector3(1.16, 0.47, 0.81),
+            new THREE.Vector3(1.16, 0.47, -0.81)
+        ];
+        hC2Positions.forEach(p => {
+            const h = createAtom('H'); h.position.copy(p); ethaneGroup.add(h);
+            ethaneGroup.add(createBond(c2Pos, p));
+        });
+
+        ethaneGroup.position.set(-3.1, 0.25, 0);
+        coreGroup.add(ethaneGroup);
+
+        // 2. ISOBUTYLENE (C4H8 / 2-Methylpropene)
+        const isobutyleneGroup = new THREE.Group();
+        const centralCPos = new THREE.Vector3(0, 0, 0);
+        const doubleCPos = new THREE.Vector3(0, 1.34, 0);
+        const methyl1Pos = new THREE.Vector3(1.26, -0.78, 0);
+        const methyl2Pos = new THREE.Vector3(-1.26, -0.78, 0);
+
+        const cCentral = createAtom('C'); cCentral.position.copy(centralCPos); isobutyleneGroup.add(cCentral);
+        const cDouble = createAtom('C'); cDouble.position.copy(doubleCPos); isobutyleneGroup.add(cDouble);
+        const cMethyl1 = createAtom('C'); cMethyl1.position.copy(methyl1Pos); isobutyleneGroup.add(cMethyl1);
+        const cMethyl2 = createAtom('C'); cMethyl2.position.copy(methyl2Pos); isobutyleneGroup.add(cMethyl2);
+
+        // C=C Double Bond
+        const dbOff = new THREE.Vector3(0.11, 0, 0);
+        isobutyleneGroup.add(createBond(centralCPos.clone().add(dbOff), doubleCPos.clone().add(dbOff), 0.085));
+        isobutyleneGroup.add(createBond(centralCPos.clone().sub(dbOff), doubleCPos.clone().sub(dbOff), 0.085));
+
+        // C-C Single Bonds to Methyl groups
+        isobutyleneGroup.add(createBond(centralCPos, methyl1Pos, 0.14));
+        isobutyleneGroup.add(createBond(centralCPos, methyl2Pos, 0.14));
+
+        // Hydrogens on =CH2
+        [new THREE.Vector3(0.92, 1.92, 0), new THREE.Vector3(-0.92, 1.92, 0)].forEach(p => {
+            const h = createAtom('H'); h.position.copy(p); isobutyleneGroup.add(h);
+            isobutyleneGroup.add(createBond(doubleCPos, p));
+        });
+
+        // Hydrogens on Methyl 1 & Methyl 2
+        const hM1 = [
+            new THREE.Vector3(2.22, -0.48, 0.52),
+            new THREE.Vector3(2.22, -0.48, -0.52),
+            new THREE.Vector3(1.12, -1.92, 0)
+        ];
+        hM1.forEach(p => {
+            const h = createAtom('H'); h.position.copy(p); isobutyleneGroup.add(h);
+            isobutyleneGroup.add(createBond(methyl1Pos, p));
+        });
+
+        const hM2 = [
+            new THREE.Vector3(-2.22, -0.48, 0.52),
+            new THREE.Vector3(-2.22, -0.48, -0.52),
+            new THREE.Vector3(-1.12, -1.92, 0)
+        ];
+        hM2.forEach(p => {
+            const h = createAtom('H'); h.position.copy(p); isobutyleneGroup.add(h);
+            isobutyleneGroup.add(createBond(methyl2Pos, p));
+        });
+
+        isobutyleneGroup.position.set(3.1, -0.25, 0);
+        isobutyleneGroup.scale.set(0.88, 0.88, 0.88);
+        coreGroup.add(isobutyleneGroup);
+
+        // --- BACKGROUND VAPOR MOLECULES (METHANE & CO2 IN BOKEH DEPTH ZONE) ---
+        const vaporMolecules = [];
+        const vaporCount = 38;
+
+        function createMethaneModel() {
+            const group = new THREE.Group();
+            const cp = new THREE.Vector3(0, 0, 0);
+            group.add(createAtom('C'));
+
+            const hOffsets = [
+                new THREE.Vector3(0.58, 0.58, 0.58),
+                new THREE.Vector3(-0.58, -0.58, 0.58),
+                new THREE.Vector3(-0.58, 0.58, -0.58),
+                new THREE.Vector3(0.58, -0.58, -0.58)
+            ];
+            hOffsets.forEach(hp => {
+                const h = createAtom('H');
+                h.scale.set(0.8, 0.8, 0.8);
+                h.position.copy(hp);
+                group.add(h);
+                group.add(createBond(cp, hp, 0.08));
+            });
+            group.scale.set(0.54, 0.54, 0.54);
+            return group;
+        }
+
+        function createCO2Model() {
+            const group = new THREE.Group();
+            const cp = new THREE.Vector3(0, 0, 0);
+            const o1p = new THREE.Vector3(1.12, 0, 0);
+            const o2p = new THREE.Vector3(-1.12, 0, 0);
+
+            const c = createAtom('C'); c.position.copy(cp); group.add(c);
+            const o1 = createAtom('O'); o1.position.copy(o1p); group.add(o1);
+            const o2 = createAtom('O'); o2.position.copy(o2p); group.add(o2);
+
+            const dbOffset = new THREE.Vector3(0, 0.07, 0);
+            group.add(createBond(cp.clone().add(dbOffset), o1p.clone().add(dbOffset), 0.065));
+            group.add(createBond(cp.clone().sub(dbOffset), o1p.clone().sub(dbOffset), 0.065));
+            group.add(createBond(cp.clone().add(dbOffset), o2p.clone().add(dbOffset), 0.065));
+            group.add(createBond(cp.clone().sub(dbOffset), o2p.clone().sub(dbOffset), 0.065));
+
+            group.scale.set(0.58, 0.58, 0.58);
+            return group;
+        }
+
+        for (let i = 0; i < vaporCount; i++) {
+            const isCH4 = i % 2 === 0;
+            const mol = isCH4 ? createMethaneModel() : createCO2Model();
+
+            // Place behind the focal plane (z from -4.5 down to -18) so BokehPass blurs them naturally
+            const z = -4.5 - Math.random() * 13.5;
+            const spreadScale = 1 + Math.abs(z) * 0.065;
+            const x = (Math.random() - 0.5) * 26 * spreadScale;
+            const y = (Math.random() - 0.5) * 15 * spreadScale;
+
+            mol.position.set(x, y, z);
+            mol.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
+
+            mol.userData = {
+                basePosition: new THREE.Vector3(x, y, z),
+                rotSpeed: new THREE.Vector3(
+                    (Math.random() - 0.5) * 0.012,
+                    (Math.random() - 0.5) * 0.012,
+                    (Math.random() - 0.5) * 0.012
+                ),
+                floatFreq: 0.7 + Math.random() * 1.4,
+                floatAmp: 0.25 + Math.random() * 0.45,
+                vibFreq: 4.5 + Math.random() * 4.0,
+                vibAmp: 0.035 + Math.random() * 0.03,
+                phaseOffset: Math.random() * Math.PI * 2
+            };
+
+            scene.add(mol);
+            vaporMolecules.push(mol);
+        }
+
+        // --- GOLDEN OIL VAPOR DUST / BOKEH MOTES ---
+        // Soft circular glowing particles matching the golden-amber oil palette
+        const particleCount = 260;
+        const particleGeometry = new THREE.BufferGeometry();
+        const particlePositions = new Float32Array(particleCount * 3);
+
+        for (let i = 0; i < particleCount * 3; i += 3) {
+            particlePositions[i] = (Math.random() - 0.5) * 38;
+            particlePositions[i + 1] = (Math.random() - 0.5) * 24;
+            particlePositions[i + 2] = -2 - Math.random() * 20;
+        }
+        particleGeometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3));
+
+        // Procedural soft radial glow sprite for warm bokeh specks
+        const spriteCanvas = document.createElement('canvas');
+        spriteCanvas.width = 32;
+        spriteCanvas.height = 32;
+        const ctx = spriteCanvas.getContext('2d');
+        const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(255, 220, 130, 1)');
+        grad.addColorStop(0.45, 'rgba(245, 158, 11, 0.45)');
+        grad.addColorStop(1, 'rgba(217, 119, 6, 0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 32, 32);
+        const glowTexture = new THREE.CanvasTexture(spriteCanvas);
+
+        const particleMaterial = new THREE.PointsMaterial({
+            map: glowTexture,
+            color: 0xfbbf24,
+            size: 0.22,
+            transparent: true,
+            opacity: 0.5,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        const dustParticles = new THREE.Points(particleGeometry, particleMaterial);
+        scene.add(dustParticles);
+
+        // --- INTERACTION & ANIMATION LOOP ---
+        let mouseX = 0;
+        let mouseY = 0;
+        let targetX = 0;
+        let targetY = 0;
+        const vibrationActive = true;
+
+        window.addEventListener('mousemove', (event) => {
+            mouseX = (event.clientX / window.innerWidth) * 2 - 1;
+            mouseY = -(event.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        window.addEventListener('touchmove', (event) => {
+            if (event.touches.length > 0) {
+                mouseX = (event.touches[0].clientX / window.innerWidth) * 2 - 1;
+                mouseY = -(event.touches[0].clientY / window.innerHeight) * 2 + 1;
+            }
+        }, { passive: true });
+
+        // Responsive layout adjustment for mobile screens so Ethane & Isobutylene never clip
+        function adjustResponsiveLayout() {
+            const aspect = window.innerWidth / window.innerHeight;
+            if (aspect < 0.85) {
+                // Stack slightly vertically on narrow portrait screens
+                ethaneGroup.position.set(-1.35, 1.45, 0);
+                isobutyleneGroup.position.set(1.35, -1.45, 0);
+                coreGroup.scale.set(0.82, 0.82, 0.82);
+            } else {
+                // Side-by-side balanced framing on tablet/desktop
+                ethaneGroup.position.set(-3.1, 0.25, 0);
+                isobutyleneGroup.position.set(3.1, -0.25, 0);
+                coreGroup.scale.set(1, 1, 1);
+            }
+        }
+        adjustResponsiveLayout();
+
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const elapsedTime = clock.getElapsedTime();
+
+            // Smooth mouse parallax interpolation
+            targetX += (mouseX - targetX) * 0.045;
+            targetY += (mouseY - targetY) * 0.045;
+
+            camera.position.x = targetX * 1.4;
+            camera.position.y = targetY * 1.1;
+            camera.lookAt(0, 0, 0);
+
+            // Keep Bokeh focal distance locked onto the central molecules at z = 0
+            if (bokehPass && bokehPass.uniforms && bokehPass.uniforms['focus']) {
+                bokehPass.uniforms['focus'].value = camera.position.length();
+            }
+
+            // Gentle orbital sway of the central foreground pair
+            coreGroup.rotation.y = Math.sin(elapsedTime * 0.22) * 0.14 + targetX * 0.12;
+            coreGroup.rotation.x = Math.cos(elapsedTime * 0.18) * 0.06 - targetY * 0.1;
+
+            // Slow, graceful rotation of Ethane & Isobutylene in sharp focus
+            ethaneGroup.rotation.x = elapsedTime * 0.18;
+            ethaneGroup.rotation.y = elapsedTime * 0.24;
+            ethaneGroup.rotation.z = Math.sin(elapsedTime * 0.2) * 0.15;
+
+            isobutyleneGroup.rotation.x = -elapsedTime * 0.15;
+            isobutyleneGroup.rotation.y = -elapsedTime * 0.21;
+            isobutyleneGroup.rotation.z = Math.cos(elapsedTime * 0.18) * 0.12;
+
+            // Background Methane & CO2 thermal drift + subtle molecular vibration
+            vaporMolecules.forEach((mol) => {
+                mol.rotation.x += mol.userData.rotSpeed.x;
+                mol.rotation.y += mol.userData.rotSpeed.y;
+                mol.rotation.z += mol.userData.rotSpeed.z;
+
+                if (vibrationActive) {
+                    const { basePosition, floatFreq, floatAmp, vibFreq, vibAmp, phaseOffset } = mol.userData;
+
+                    // Slow Brownian gas drift
+                    const driftX = Math.sin(elapsedTime * floatFreq + phaseOffset) * floatAmp;
+                    const driftY = Math.cos(elapsedTime * (floatFreq * 0.85) + phaseOffset) * (floatAmp * 0.8);
+                    const driftZ = Math.sin(elapsedTime * (floatFreq * 0.6) + phaseOffset) * 0.25;
+
+                    // Subtle high-frequency thermal vibration
+                    const microVibX = Math.sin(elapsedTime * vibFreq + phaseOffset) * vibAmp;
+                    const microVibY = Math.cos(elapsedTime * (vibFreq * 1.13) + phaseOffset) * vibAmp;
+
+                    mol.position.set(
+                        basePosition.x + driftX + microVibX,
+                        basePosition.y + driftY + microVibY,
+                        basePosition.z + driftZ
+                    );
+                }
+            });
+
+            // Slow drift of golden oil motes
+            dustParticles.rotation.y = elapsedTime * 0.015;
+            dustParticles.position.y = Math.sin(elapsedTime * 0.3) * 0.25;
+
+            if (usePostProcessing && composer) {
+                composer.render();
+            } else {
+                renderer.render(scene, camera);
+            }
+        }
+
+        window.onload = function () {
+            animate();
+        };
+
+        // --- RESPONSIVE RESIZE HANDLER ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            if (composer) {
+                composer.setSize(window.innerWidth, window.innerHeight);
+            }
+            adjustResponsiveLayout();
+        });
+    </script>
+</body>
+</html>
